@@ -280,3 +280,7 @@ echo "sudo systemctl reload nginx - qayta yuklash"
 echo "sudo tail -f /var/log/nginx/selxoz_access.log - loglar"
 echo ""
 echo "=== MUVAFFAQIYATLI YAKUNLANDI! 🎉 ==="
+
+
+
+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
