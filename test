@@ -1,0 +1,282 @@
+#!/bin/bash
+# Nginx + PM2 ni 0 dan sozlash (backend papkasida)
+
+echo "=== Nginx + PM2 To'liq Sozlash Boshlandi ==="
+
+# 1. Papkani aniqlash
+BACKEND_DIR="/home/sarbon/app/web-selxoz-backend"
+FRONTEND_DIR="/home/sarbon/app/web-selxoz-frontend"  # Agar bo'lsa
+
+echo "Backend papka: $BACKEND_DIR"
+echo "Frontend papka: $FRONTEND_DIR"
+
+# 2. Nginx ni o'rnatish
+echo "=== 2. Nginx o'rnatilmoqda ==="
+sudo apt update
+sudo apt install nginx -y
+
+# 3. Nginx xizmatini sozlash
+echo "=== 3. Nginx xizmati sozlanmoqda ==="
+sudo systemctl start nginx
+sudo systemctl enable nginx
+sudo systemctl status nginx
+
+# 4. PM2 o'rnatish
+echo "=== 4. PM2 o'rnatilmoqda ==="
+sudo npm install -g pm2
+
+# 5. Nginx konfiguratsiyasi (ichki IP uchun)
+echo "=== 5. Nginx konfiguratsiyasi yaratilmoqda ==="
+
+sudo tee /etc/nginx/sites-available/selxoz-internal > /dev/null << 'EOF'
+# HTTP server (port 80) - Ichki IP uchun
+server {
+    listen 80;
+    server_name 172.16.5.112 localhost;
+
+    # Access log
+    access_log /var/log/nginx/selxoz_access.log;
+    error_log /var/log/nginx/selxoz_error.log;
+
+    # Frontend (React/Vite) - port 3000
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        
+        # Frontend uchun timeout
+        proxy_read_timeout 60s;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+
+    # Backend API (Node.js) - port 5000
+    location /api/ {
+        proxy_pass http://localhost:5000/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        
+        # Katta fayllar uchun (30 daqiqa timeout)
+        proxy_read_timeout 1800s;
+        proxy_connect_timeout 1800s;
+        proxy_send_timeout 1800s;
+        client_max_body_size 5G;
+        
+        # CORS headers
+        add_header 'Access-Control-Allow-Origin' '*' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
+        add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+    }
+
+    # Python API (FastAPI) - port 8000
+    location /python-api/ {
+        proxy_pass http://localhost:8000/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        
+        # Python API uchun timeout
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 300s;
+        proxy_send_timeout 300s;
+        client_max_body_size 100M;
+    }
+
+    # Static fayllar (uploads)
+    location /uploads/ {
+        alias $BACKEND_DIR/uploads/;
+        expires 30d;
+        add_header Cache-Control "public";
+        
+        # Xavfsizlik - faqat ruxsat etilgan fayllar
+        location ~* \.(jpg|jpeg|png|gif|ico|css|js|pdf|doc|docx|xls|xlsx|csv)$ {
+            expires 30d;
+            add_header Cache-Control "public";
+        }
+        
+        # Xavfli fayllarni bloklash
+        location ~* \.(php|jsp|asp|sh|pl|py|exe|bat)$ {
+            deny all;
+        }
+    }
+
+    # Health check endpoint
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+        add_header Content-Type text/plain;
+    }
+
+    # Nginx status
+    location /nginx_status {
+        stub_status on;
+        access_log off;
+        allow 127.0.0.1;
+        allow 172.16.0.0/16;
+        deny all;
+    }
+}
+EOF
+
+# 6. Nginx konfiguratsiyasini faollashtirish
+echo "=== 6. Nginx konfiguratsiyasi faollashtirilmoqda ==="
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo ln -s /etc/nginx/sites-available/selxoz-internal /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+
+# 7. PM2 ecosystem.config.js yaratish
+echo "=== 7. PM2 ecosystem.config.js yaratilmoqda ==="
+
+cd $BACKEND_DIR
+
+cat > ecosystem.config.js << 'EOF'
+module.exports = {
+  apps: [
+    {
+      name: 'selxoz-backend',
+      script: 'app.js',
+      instances: 1,
+      exec_mode: 'fork',
+      env: {
+        NODE_ENV: 'production',
+        PORT: 5000
+      },
+      max_memory_restart: '1G',
+      error_file: './logs/backend-error.log',
+      out_file: './logs/backend-out.log',
+      log_file: './logs/backend-combined.log',
+      time: true,
+      autorestart: true,
+      watch: false,
+      max_restarts: 10,
+      min_uptime: '10s'
+    },
+    {
+      name: 'selxoz-python-api',
+      script: 'uvicorn',
+      args: 'app.main:app --host 0.0.0.0 --port 8000',
+      cwd: './logika_api',
+      interpreter: '/usr/bin/python3',
+      instances: 1,
+      exec_mode: 'fork',
+      env: {
+        PYTHONPATH: './logika_api'
+      },
+      max_memory_restart: '500M',
+      error_file: './logs/python-api-error.log',
+      out_file: './logs/python-api-out.log',
+      log_file: './logs/python-api-combined.log',
+      time: true,
+      autorestart: true,
+      watch: false,
+      max_restarts: 10,
+      min_uptime: '10s'
+    }
+  ]
+};
+EOF
+
+# 8. Log papkalarini yaratish
+echo "=== 8. Log papkalari yaratilmoqda ==="
+mkdir -p logs
+mkdir -p uploads
+
+# 9. Backend dependencies larni o'rnatish
+echo "=== 9. Backend dependencies o'rnatilmoqda ==="
+npm install
+
+# 10. Python API dependencies larni o'rnatish
+echo "=== 10. Python API dependencies o'rnatilmoqda ==="
+cd logika_api
+pip install -r requirements.txt
+cd ..
+
+# 11. PM2 ni boshqarish
+echo "=== 11. PM2 xizmatlari boshlanmoqda ==="
+
+# Eski processlarni to'xtatish
+pm2 delete all 2>/dev/null || true
+
+# Yangi processlarni boshlash
+pm2 start ecosystem.config.js
+
+# PM2 ni startup ga qo'shish
+pm2 startup
+pm2 save
+
+# 12. Firewall sozlash
+echo "=== 12. Firewall sozlanmoqda ==="
+sudo ufw allow 80
+sudo ufw allow 443
+sudo ufw allow 22
+sudo ufw allow 3000
+sudo ufw allow 5000
+sudo ufw allow 8000
+sudo ufw --force enable
+
+# 13. Test qilish
+echo "=== 13. Test qilish ==="
+
+echo "Nginx test:"
+curl -s http://localhost || echo "Nginx ishlamayapti"
+
+echo ""
+echo "Backend test:"
+curl -s http://localhost:5000 || echo "Backend ishlamayapti"
+
+echo ""
+echo "Python API test:"
+curl -s http://localhost:8000 || echo "Python API ishlamayapti"
+
+echo ""
+echo "PM2 status:"
+pm2 status
+
+echo ""
+echo "Nginx status:"
+sudo systemctl status nginx --no-pager
+
+# 14. Yakuniy ma'lumotlar
+echo "=== YAKUNIY MA'LUMOTLAR ==="
+echo "✅ Nginx o'rnatildi va sozlandi"
+echo "✅ PM2 o'rnatildi va sozlandi"
+echo "✅ Backend boshlandi (port 5000)"
+echo "✅ Python API boshlandi (port 8000)"
+echo "✅ Frontend uchun port 3000 tayyor"
+echo ""
+echo "URL lar:"
+echo "http://172.16.5.112 - Frontend (agar frontend ishsa)"
+echo "http://172.16.5.112/api/ - Backend API"
+echo "http://172.16.5.112/python-api/ - Python API"
+echo "http://172.16.5.112/health - Health check"
+echo ""
+echo "PM2 buyruqlari:"
+echo "pm2 status - holatni ko'rish"
+echo "pm2 logs - loglarni ko'rish"
+echo "pm2 restart all - qayta ishga tushirish"
+echo "pm2 stop all - to'xtatish"
+echo ""
+echo "Nginx buyruqlari:"
+echo "sudo nginx -t - konfiguratsiyani test qilish"
+echo "sudo systemctl reload nginx - qayta yuklash"
+echo "sudo tail -f /var/log/nginx/selxoz_access.log - loglar"
+echo ""
+echo "=== MUVAFFAQIYATLI YAKUNLANDI! 🎉 ==="
